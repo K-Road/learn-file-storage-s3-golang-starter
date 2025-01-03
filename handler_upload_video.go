@@ -91,14 +91,13 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	tmp.Seek(0, io.SeekStart)
 
-	key := getAssetPath(mediaType)
-
 	//get aspect ratio
 	aspectRatio, err := getVideoAspectRatio(tmp.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to find aspect", err)
 		return
 	}
+
 	aspect := ""
 	switch aspectRatio {
 	case "16:9":
@@ -108,12 +107,27 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	default:
 		aspect = "other"
 	}
+	key := getAssetPath(mediaType)
 	key = filepath.Join(aspect, key)
+
+	processedFilePath, err := processVideoForFastStart(tmp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable fast process", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to open processed file", err)
+		return
+	}
+	defer processedFile.Close()
 
 	_, err = cfg.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tmp,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -179,4 +193,26 @@ func getVideoAspectRatio(filePath string) (string, error) {
 
 func almostEqual(a, b, tolerance float64) bool {
 	return math.Abs(a-b) < tolerance
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	processedFilePath := fmt.Sprintf("%s.processing", filePath)
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", processedFilePath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error processing video: %s, %v", stderr.String(), err)
+	}
+
+	fileInfo, err := os.Stat(processedFilePath)
+	if err != nil {
+		return "", fmt.Errorf("could not stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+
+	return processedFilePath, nil
+
 }
