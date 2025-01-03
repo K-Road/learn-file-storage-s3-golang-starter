@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -87,6 +93,23 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	key := getAssetPath(mediaType)
 
+	//get aspect ratio
+	aspectRatio, err := getVideoAspectRatio(tmp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to find aspect", err)
+		return
+	}
+	aspect := ""
+	switch aspectRatio {
+	case "16:9":
+		aspect = "landscape"
+	case "9:16":
+		aspect = "portrait"
+	default:
+		aspect = "other"
+	}
+	key = filepath.Join(aspect, key)
+
 	_, err = cfg.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
@@ -107,4 +130,53 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type VideoStream struct {
+		CodecName string `json:"codec_name"`
+		Width     int    `json:"width"`
+		Height    int    `json:"height"`
+		Duration  string `json:"duration"`
+	}
+	type FFprobeResult struct {
+		Streams []VideoStream `json:"streams"`
+	}
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	var result FFprobeResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		return "", fmt.Errorf("could not parse ffprobe: %v", err)
+	}
+
+	if len(result.Streams) == 0 {
+		return "", errors.New("no video streams found")
+	}
+
+	stream := result.Streams[0]
+	aspectRatio := float64(stream.Height) / float64(stream.Width)
+	const tolerance = 0.01
+	switch {
+	case almostEqual(aspectRatio, 9.0/16.0, tolerance):
+		return "16:9", nil
+	case almostEqual(aspectRatio, 4.0/3.0, tolerance):
+		return "4:3", nil
+	case almostEqual(aspectRatio, 16.0/9.0, tolerance):
+		return "9:16", nil
+	case almostEqual(aspectRatio, 1.0, tolerance):
+		return "1:1", nil
+	default:
+		return "Other", nil
+	}
+}
+
+func almostEqual(a, b, tolerance float64) bool {
+	return math.Abs(a-b) < tolerance
 }
