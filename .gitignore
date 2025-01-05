@@ -3,3 +3,6 @@ out
 .env
 assets/
 samples/
+
+.codegpt
+.vscode
